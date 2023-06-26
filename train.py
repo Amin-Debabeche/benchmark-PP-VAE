@@ -8,19 +8,21 @@ import torch.utils.data
 from torch import nn, optim
 import torch.nn.functional as F
 
-from models import MolecularVAE
+from model import MolecularVAE
 from torch.utils.tensorboard import SummaryWriter
-from featurizer import OneHotFeaturizer
+from utils.featurizer import OneHotFeaturizer
 
 import wandb
 wandb.init(project="vae_dummy")
+
+method = "GD"
 
 # training property loss stagnates at 0.6 if kl div is set to 1 at the start
 # So try step-wise schedule with warmup time
 
 # batch_size = 100
 # epochs = 100
-os.environ["CUDA_VISIBLE_DEVICES"]="0,2"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -38,6 +40,24 @@ def loss_function(recon_x, x, mu, logvar, pred_y, y):
     prop_loss = F.mse_loss(pred_y, y)  # mean
     return CE, KLD, prop_loss
 
+def optimize_property_with_gradient_ascent(model, init_z, optimizer, num_steps=5000, device='cpu'):
+    z = init_z
+    for _ in range(num_steps):
+        optimizer.zero_grad()
+        props = model.predict_prop(z)
+        (-props).mean().backward()  # gradient ascent so we use negative props
+        optimizer.step()
+        # apply tanh activation to keep the values of z in range
+        z.data = torch.tanh(z.data)
+    return z
+
+def optimize_property(model, num_samples=500, latent_dim=196, device='cpu'):
+    model.eval()  # set the model to evaluation mode
+    init_z = torch.randn(num_samples, latent_dim).to(device)
+    optimizer = torch.optim.Adam([init_z], lr=0.01)
+    z_optimized = optimize_property_with_gradient_ascent(model, init_z, optimizer, device=device)
+    model.train()  # set the model back to training mode
+    return z_optimized
 
 def train(epoch, num_iters):
     model.train()
@@ -197,11 +217,12 @@ if __name__ == '__main__':
         model = torch.nn.DataParallel(model)
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
-    TB_LOG_PATH = '{}_runs_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional'.format(
-        task, beta, lr, prop_weight, recon_weight)
-    weights_path = '{}_weights_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional'.format(
-        task, beta, lr, prop_weight, recon_weight)
+    TB_LOG_PATH = 'models/{}_{}_runs_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional'.format(
+        method, task, beta, lr, prop_weight, recon_weight)
+    weights_path = 'models/{}_{}_weights_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional'.format(
+        method, task, beta, lr, prop_weight, recon_weight)
 
     if not os.path.isdir(TB_LOG_PATH):
         os.makedirs(TB_LOG_PATH)
@@ -213,8 +234,15 @@ if __name__ == '__main__':
     num_iters = 0
     for epoch in range(1, epochs + 1):
         train_loss, num_iters = train(epoch, num_iters)
+        scheduler.step()
+        
+        if epoch % 5 == 0 or epoch == 1:  # optimize properties every 5 epochs
+            z_optimized = optimize_property(model, device=device)
+            print(f"Optimized z at epoch {epoch}: {z_optimized}")
+            wandb.log({"Optimized z": z_optimized}) # Logging w&b
+        
         if epoch % 1 == 0:
             torch.save(model.state_dict(),
-                       './{}_weights_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional/vae-{:03d}-{}.pth'.format(task, beta, lr, prop_weight, recon_weight, epoch, train_loss))
+                       './models/{}_{}_weights_kl_{}_lr_{}_prop_{}_recon_{}_smaller_latent_normalized_y_linear_MLP_patent_bidirectional/vae-{:03d}-{}.pth'.format(method, task, beta, lr, prop_weight, recon_weight, epoch, train_loss))
             
     print('===== Finished =====')
